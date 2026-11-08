@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint
+        run: uvx ruff check .
+      - name: Test
+        run: uv run --python 3.12 --group dev pytest -q
+
+  forecast-gate:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Backtest gate (P10 to P90 coverage in 70% to 90%, deal model beats rep roll-up mid-quarter)
+        run: uv run --python 3.12 pipecast eval --gate --out reports-ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backtest-report
+          path: reports-ci/
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pipeline-forecast:ci .
+      - name: Smoke test the container
+        run: |
+          docker run -d --name pipecast -e PIPECAST_RATE_SCALE=0.5 -p 8854:8854 pipeline-forecast:ci
+          for i in $(seq 1 240); do curl -sf localhost:8854/healthz && break; sleep 1; done
+          curl -sf localhost:8854/healthz || { docker logs pipecast | tail -50; exit 1; }
+          curl -sf "localhost:8854/api/forecast?week=7" | head -c 300
+          curl -sf "localhost:8854/api/risk?limit=3" | head -c 300
+          curl -sf localhost:8854/api/commentary | grep -q '"valid":true'
+          curl -sf localhost:8854/metrics | grep pipecast_backtest_interval_coverage
+          docker rm -f pipecast
